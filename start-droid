@@ -194,6 +194,27 @@ class SessionEntry:
     title: str
 
 
+def _is_worker_session(settings_path: Path) -> bool:
+    """Return True if the session settings mark it as a subagent/worker session."""
+    try:
+        with settings_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    tags = data.get("tags", [])
+    for tag in tags:
+        if isinstance(tag, dict):
+            name = tag.get("name", "")
+            if name in ("mission-worker", "worker", "subagent", "agent-browser"):
+                return True
+            meta = tag.get("metadata", {})
+            if meta.get("role") in ("worker", "subagent"):
+                return True
+        elif isinstance(tag, str) and tag in ("mission-worker", "worker", "subagent", "agent-browser"):
+            return True
+    return False
+
+
 def discover_sessions() -> List[SessionEntry]:
     entries: List[SessionEntry] = []
     if not SESSIONS_DIR.exists():
@@ -204,6 +225,9 @@ def discover_sessions() -> List[SessionEntry]:
             continue
         for jsonl in folder.glob("*.jsonl"):
             session_id = jsonl.stem
+            settings_path = folder / f"{session_id}.settings.json"
+            if _is_worker_session(settings_path):
+                continue
             try:
                 mtime = jsonl.stat().st_mtime
             except OSError:
@@ -391,6 +415,11 @@ def _delete_session(entry: SessionEntry) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Session discovery
+# ---------------------------------------------------------------------------
+
+
 def pick_session(sessions: List[SessionEntry]) -> Optional[str]:
     if not _is_interactive():
         print(
@@ -488,3 +517,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
