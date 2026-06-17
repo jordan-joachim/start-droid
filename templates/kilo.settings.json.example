@@ -1,0 +1,87 @@
+{
+  "customModels": [
+    {
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "id": "custom:nemotron-3-ultra:kilo",
+      "index": 0,
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "apiKey": "${KILO_API_KEY}",
+      "displayName": "nemotron-3-ultra:kilo",
+      "maxOutputTokens": 1000000,
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    },
+    {
+      "model": "stepfun/step-3.7-flash",
+      "id": "custom:deepseek-v4-flash:kilo-1",
+      "index": 1,
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "apiKey": "${KILO_API_KEY}",
+      "displayName": "deepseek-v4-flash:kilo",
+      "maxOutputTokens": 256000,
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    },
+    {
+      "model": "moonshotai/kimi-k2.6",
+      "id": "custom:kimi-k2.6:kilo-2",
+      "index": 2,
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "apiKey": "${KILO_API_KEY}",
+      "displayName": "kimi-k2.6:kilo",
+      "maxOutputTokens": 262144,
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    },
+    {
+      "model": "z-ai/glm-5.1",
+      "id": "custom:glm-5.1:kilo-3",
+      "index": 3,
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "apiKey": "${KILO_API_KEY}",
+      "displayName": "glm-5.1:kilo",
+      "maxOutputTokens": 202752,
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    },
+    {
+      "model": "anthropic/claude-opus-4.8",
+      "id": "custom:deepseek-v4-pro:kilo-4",
+      "index": 4,
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "apiKey": "${KILO_API_KEY}",
+      "displayName": "deepseek-v4-pro:kilo",
+      "maxOutputTokens": 1000000,
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    },
+    {
+      "model": "minimax/minimax-m3",
+      "id": "custom:minimax-m3:kilo-5",
+      "index": 5,
+      "baseUrl": "https://api.kilo.ai/api/gateway",
+      "apiKey": "${KILO_API_KEY}",
+      "displayName": "minimax-m3:kilo",
+      "maxOutputTokens": 1048576,
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    }
+  ],
+  "missionModelSettings": {
+    "skipScrutiny": true,
+    "skipUserTesting": false,
+    "validationWorkerModel": "custom:nemotron-3-ultra:kilo",
+    "validationWorkerReasoningEffort": "high",
+    "workerModel": "custom:deepseek-v4-pro:kilo-4",
+    "workerReasoningEffort": "max"
+  },
+  "missionOrchestratorModel": "custom:kimi-k2.6:kilo-2",
+  "missionOrchestratorReasoningEffort": "high",
+  "sessionDefaultSettings": {
+    "autonomyLevel": "off",
+    "autonomyMode": "spec",
+    "interactionMode": "spec",
+    "model": "custom:nemotron-3-ultra:kilo",
+    "reasoningEffort": "high"
+  }
+}

@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""start-droid - Start a Droid session with Ollama or Kilo models.
+
+Usage:
+    start-droid -m ollama    # Use local Ollama models (default)
+    start-droid -m kilo      # Use Kilo AI cloud models
+    start-droid -m refresh   # Refresh model parameters from APIs, then prompt
+
+After picking the backend, a TUI lists the 10 most recent sessions with "NEW"
+at the top.  Navigate with Up/Down, scroll past item 5 to load up to 10 older
+sessions, and press Enter to resume the selected session or start a new one.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import termios
+import tty
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+HOME = Path.home()
+FACTORY_DIR = HOME / ".factory"
+START_DROID_DIR = FACTORY_DIR / "start-droid"
+SESSIONS_DIR = FACTORY_DIR / "sessions"
+
+OLLAMA_SETTINGS = START_DROID_DIR / "ollama.settings.json"
+KILO_SETTINGS = START_DROID_DIR / "kilo.settings.json"
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+KILO_BASE_URL = "https://api.kilo.ai/api/gateway"
+
+# Map our model IDs to Kilo gateway model IDs for refresh.
+KILO_MODEL_MAP = {
+    "custom:nemotron-3-ultra:kilo": "nvidia/nemotron-3-ultra-550b-a55b",
+    "custom:deepseek-v4-flash:kilo-1": "stepfun/step-3.7-flash",
+    "custom:kimi-k2.6:kilo-2": "moonshotai/kimi-k2.6",
+    "custom:glm-5.1:kilo-3": "z-ai/glm-5.1",
+    "custom:deepseek-v4-pro:kilo-4": "anthropic/claude-opus-4.8",
+    "custom:minimax-m3:kilo-5": "minimax/minimax-m3",
+}
+
+# Keep the same IDs and names for Ollama; only refresh context_length via /api/show.
+OLLAMA_MODEL_NAMES = [
+    "nemotron-3-ultra:cloud",
+    "deepseek-v4-flash:cloud",
+    "kimi-k2.6:cloud",
+    "glm-5.1:cloud",
+    "deepseek-v4-pro:cloud",
+    "minimax-m3:cloud",
+    "kimi-k2.7-code:cloud",
+]
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(path: Path, data: dict) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def http_get_json(url: str, timeout: int = 30) -> Optional[dict]:
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: request to {url} failed: {exc}", file=sys.stderr)
+        return None
+
+
+def http_post_json(url: str, payload: dict, timeout: int = 30) -> Optional[dict]:
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: request to {url} failed: {exc}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Refresh logic
+# ---------------------------------------------------------------------------
+
+def find_context_length_key(model_info: dict) -> Optional[str]:
+    for key in model_info:
+        if ".context_length" in key:
+            return key
+    return None
+
+
+def refresh_ollama_context_length(model_name: str) -> Optional[int]:
+    payload = {"model": model_name}
+    url = f"{OLLAMA_BASE_URL}/api/show"
+    data = http_post_json(url, payload, timeout=30)
+    if not data:
+        return None
+    key = find_context_length_key(data.get("model_info", {}))
+    if key:
+        return data["model_info"][key]
+    return None
+
+
+def refresh_ollama_models(settings: dict) -> dict:
+    """Refresh maxOutputTokens from Ollama /api/show for known cloud models."""
+    for model in settings.get("customModels", []):
+        name = model.get("model", "")
+        if name not in OLLAMA_MODEL_NAMES:
+            continue
+        ctx = refresh_ollama_context_length(name)
+        if ctx is not None and ctx > 0:
+            model["maxOutputTokens"] = ctx
+        else:
+            print(
+                f"warning: could not refresh context_length for {name}",
+                file=sys.stderr,
+            )
+    return settings
+
+
+def refresh_kilo_models(settings: dict) -> dict:
+    """Refresh maxOutputTokens from Kilo /api/gateway/models."""
+    data = http_get_json(f"{KILO_BASE_URL}/models", timeout=30)
+    if not data:
+        return settings
+
+    by_id = {m["id"]: m for m in data.get("data", []) if "id" in m}
+    for model in settings.get("customModels", []):
+        kilo_id = KILO_MODEL_MAP.get(model.get("id", ""))
+        if not kilo_id:
+            continue
+        meta = by_id.get(kilo_id)
+        if not meta:
+            print(
+                f"warning: Kilo gateway no longer reports {kilo_id}",
+                file=sys.stderr,
+            )
+            continue
+        ctx = meta.get("context_length")
+        if ctx is not None and ctx > 0:
+            model["maxOutputTokens"] = ctx
+        else:
+            print(
+                f"warning: no context_length for {kilo_id}",
+                file=sys.stderr,
+            )
+    return settings
+
+
+def refresh_mode() -> None:
+    """Refresh both settings files, then default to Ollama for the TUI."""
+    if OLLAMA_SETTINGS.exists():
+        ollama = refresh_ollama_models(load_json(OLLAMA_SETTINGS))
+        save_json(OLLAMA_SETTINGS, ollama)
+        print(f"refreshed {OLLAMA_SETTINGS}")
+    if KILO_SETTINGS.exists():
+        kilo = refresh_kilo_models(load_json(KILO_SETTINGS))
+        save_json(KILO_SETTINGS, kilo)
+        print(f"refreshed {KILO_SETTINGS}")
+
+
+# ---------------------------------------------------------------------------
+# Session discovery
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionEntry:
+    session_id: str
+    folder: Path
+    mtime: float
+    title: str
+
+
+def discover_sessions() -> List[SessionEntry]:
+    entries: List[SessionEntry] = []
+    if not SESSIONS_DIR.exists():
+        return entries
+
+    for folder in SESSIONS_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        for jsonl in folder.glob("*.jsonl"):
+            session_id = jsonl.stem
+            try:
+                mtime = jsonl.stat().st_mtime
+            except OSError:
+                continue
+            title = _session_title(jsonl)
+            entries.append(SessionEntry(session_id, folder, mtime, title))
+
+    entries.sort(key=lambda e: e.mtime, reverse=True)
+    return entries
+
+
+def _session_title(jsonl_path: Path) -> str:
+    try:
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "session_start":
+                    return event.get("sessionTitle", "") or event.get("title", "") or ""
+                if "sessionTitle" in event:
+                    return event["sessionTitle"]
+                if "title" in event:
+                    return event["title"]
+                break
+    except OSError:
+        pass
+    return ""
+
+
+def _safe_truncate(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "…"
+
+
+def _format_time(mtime: float) -> str:
+    dt = datetime.fromtimestamp(mtime, tz=timezone.utc).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+# ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+
+class SessionPicker:
+    WINDOW_SIZE = 10
+    SCROLL_TRIGGER = 5
+
+    def __init__(self, sessions: List[SessionEntry]):
+        self.all_sessions = sessions
+        self.offset = 0  # index into all_sessions for top of window
+        self.cursor = 0  # absolute index in all_sessions, 0 means NEW
+        self.window = self._build_window()
+
+    def _build_window(self) -> List[Tuple[str, str, str, int]]:
+        """Return rows: (label, time_or_blank, title, absolute_index)."""
+        rows = [("[NEW]", "", "Start a new session", 0)]
+        start = self.offset
+        end = min(start + self.WINDOW_SIZE, len(self.all_sessions))
+        for idx in range(start, end):
+            session = self.all_sessions[idx]
+            rows.append(
+                (
+                    session.session_id[:8],
+                    _format_time(session.mtime),
+                    session.title or f"session {session.session_id}",
+                    idx + 1,
+                )
+            )
+        return rows
+
+    def visible_rows(self) -> List[Tuple[str, str, str, int]]:
+        return self._build_window()
+
+    def move_up(self) -> None:
+        if self.cursor > 0:
+            self.cursor -= 1
+            self._adjust_window()
+
+    def move_down(self) -> None:
+        max_cursor = len(self.all_sessions)
+        if self.cursor < max_cursor:
+            self.cursor += 1
+            self._adjust_window()
+
+    def _adjust_window(self) -> None:
+        if self.cursor == 0:
+            self.offset = 0
+            return
+
+        # cursor is absolute (NEW is 0, first session is 1).
+        if self.cursor > self.offset + self.SCROLL_TRIGGER:
+            self.offset = min(
+                self.cursor - self.SCROLL_TRIGGER,
+                max(0, len(self.all_sessions) - self.WINDOW_SIZE),
+            )
+        elif self.cursor <= self.offset:
+            self.offset = max(0, self.cursor - 1)
+
+    def selected_session_id(self) -> Optional[str]:
+        if self.cursor == 0:
+            return None
+        return self.all_sessions[self.cursor - 1].session_id
+
+    def delete_selected(self) -> Optional[SessionEntry]:
+        if self.cursor == 0:
+            return None
+        removed = self.all_sessions.pop(self.cursor - 1)
+        max_cursor = len(self.all_sessions)
+        if self.cursor > max_cursor:
+            self.cursor = max_cursor
+        self._adjust_window()
+        return removed
+
+
+def _get_terminal_size() -> Tuple[int, int]:
+    import shutil
+
+    size = shutil.get_terminal_size((80, 24))
+    return size.columns, size.lines
+
+
+def _render(picker: SessionPicker, status: Optional[str] = None) -> None:
+    rows = picker.visible_rows()
+    cols, _ = _get_terminal_size()
+    print("\033[2J\033[H", end="")
+    print("Select a session (Up/Down, Enter; Delete/D to remove):")
+    print("-" * min(cols, 78))
+
+    label_width = 10
+    time_width = 18
+    title_width = max(20, cols - label_width - time_width - 6)
+
+    for label, when, title, abs_idx in rows:
+        marker = " > " if picker.cursor == abs_idx else "   "
+        line = f"{marker}{label:<{label_width}} {when:<{time_width}} {_safe_truncate(title, title_width)}"
+        if picker.cursor == abs_idx:
+            print(f"\033[7m{line[:cols]}\033[0m")
+        else:
+            print(line[:cols])
+
+    remaining = len(picker.all_sessions) - picker.offset - len(rows) + 1
+    if remaining > 0:
+        print(f"\n  … {remaining} older sessions")
+    print("-" * min(cols, 78))
+    if status:
+        print(status)
+    else:
+        print("Press Enter to select, q/Ctrl-C to quit.")
+
+
+def _is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _read_key() -> str:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            seq = sys.stdin.read(2)
+            return ch + seq
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _delete_session(entry: SessionEntry) -> None:
+    """Remove session .jsonl and .settings.json files."""
+    base = entry.folder / entry.session_id
+    for suffix in (".jsonl", ".settings.json"):
+        path = base.with_suffix(suffix)
+        if path.exists():
+            path.unlink()
+    # Clean up empty session folder.
+    try:
+        entry.folder.rmdir()
+    except OSError:
+        pass
+
+
+def pick_session(sessions: List[SessionEntry]) -> Optional[str]:
+    if not _is_interactive():
+        print(
+            "error: a TTY is required to select a session interactively",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    picker = SessionPicker(sessions)
+    deleted_last: Optional[str] = None
+    try:
+        while True:
+            _render(picker, deleted_last)
+            deleted_last = None
+            key = _read_key()
+            if key in ("\x1b[A", "k"):
+                picker.move_up()
+            elif key in ("\x1b[B", "j"):
+                picker.move_down()
+            elif key in ("\r", "\n"):
+                print("\033[2J\033[H", end="")
+                return picker.selected_session_id()
+            elif key in ("\x7f", "\x08", "d"):
+                entry = picker.delete_selected()
+                if entry is None:
+                    deleted_last = "Cannot delete [NEW]."
+                else:
+                    _delete_session(entry)
+                    deleted_last = f"Deleted session {entry.session_id[:8]}."
+            elif key in ("q", "\x03", "\x04"):
+                print("\033[2J\033[H", end="")
+                raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        print("\033[2J\033[H", end="")
+        print("Cancelled.")
+        sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Droid launch
+# ---------------------------------------------------------------------------
+
+def launch_droid(settings_file: Path, session_id: Optional[str]) -> None:
+    cmd = ["droid", "--settings", str(settings_file)]
+    if session_id:
+        cmd.extend(["--resume", session_id])
+    print("Starting:", " ".join(cmd))
+    os.execvp("droid", cmd)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Start Droid with Ollama or Kilo custom model settings.",
+    )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        required=True,
+        choices=["ollama", "kilo", "refresh"],
+        help="Backend mode: ollama (default file), kilo, or refresh model parameters.",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if args.mode == "refresh":
+        refresh_mode()
+        settings_file = OLLAMA_SETTINGS
+    elif args.mode == "kilo":
+        if "KILO_API_KEY" not in os.environ:
+            print(
+                "error: KILO_API_KEY environment variable is required for kilo mode",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        settings_file = KILO_SETTINGS
+    else:
+        settings_file = OLLAMA_SETTINGS
+
+    if not settings_file.exists():
+        print(f"error: settings file not found: {settings_file}", file=sys.stderr)
+        sys.exit(1)
+
+    sessions = discover_sessions()
+    session_id = pick_session(sessions)
+    launch_droid(settings_file, session_id)
+
+
+if __name__ == "__main__":
+    main()
