@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""start-droid - Start a Droid session with Ollama or Kilo models.
+"""start-droid - Start a Droid session with Ollama or OpenRouter models.
 
 Usage:
-    start-droid -m ollama    # Use local Ollama models (default)
-    start-droid -m kilo      # Use Kilo AI cloud models
-    start-droid -m refresh   # Refresh model parameters from APIs, then prompt
+    start-droid -m ollama      # Use local Ollama models (default)
+    start-droid -m openrouter  # Use OpenRouter cloud models
+    start-droid -m refresh     # Refresh model parameters from APIs, then prompt
 
 After picking the backend, a TUI lists the 10 most recent sessions with "NEW"
 at the top.  Navigate with Up/Down, scroll past item 5 to load up to 10 older
@@ -34,19 +34,19 @@ START_DROID_DIR = FACTORY_DIR / "start-droid"
 SESSIONS_DIR = FACTORY_DIR / "sessions"
 
 OLLAMA_SETTINGS = START_DROID_DIR / "ollama.settings.json"
-KILO_SETTINGS = START_DROID_DIR / "kilo.settings.json"
+OPENROUTER_SETTINGS = START_DROID_DIR / "openrouter.settings.json"
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-KILO_BASE_URL = "https://api.kilo.ai/api/gateway"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Map our model IDs to Kilo gateway model IDs for refresh.
-KILO_MODEL_MAP = {
-    "custom:nemotron-3-ultra:kilo": "nvidia/nemotron-3-ultra-550b-a55b",
-    "custom:deepseek-v4-flash:kilo-1": "stepfun/step-3.7-flash",
-    "custom:kimi-k2.6:kilo-2": "moonshotai/kimi-k2.6",
-    "custom:glm-5.1:kilo-3": "z-ai/glm-5.1",
-    "custom:deepseek-v4-pro:kilo-4": "anthropic/claude-opus-4.8",
-    "custom:minimax-m3:kilo-5": "minimax/minimax-m3",
+# Map our model IDs to OpenRouter model IDs for refresh.
+OPENROUTER_MODEL_MAP = {
+    "custom:nemotron-3-ultra:openrouter": "nvidia/nemotron-3-ultra-550b-a55b",
+    "custom:deepseek-v4-flash:openrouter-1": "stepfun/step-3.7-flash",
+    "custom:kimi-k2.6:openrouter-2": "moonshotai/kimi-k2.6",
+    "custom:glm-5.1:openrouter-3": "z-ai/glm-5.1",
+    "custom:deepseek-v4-pro:openrouter-4": "anthropic/claude-opus-4.8",
+    "custom:minimax-m3:openrouter-5": "minimax/minimax-m3",
 }
 
 # Keep the same IDs and names for Ollama; only refresh context_length via /api/show.
@@ -141,30 +141,30 @@ def refresh_ollama_models(settings: dict) -> dict:
     return settings
 
 
-def refresh_kilo_models(settings: dict) -> dict:
-    """Refresh maxOutputTokens from Kilo /api/gateway/models."""
-    data = http_get_json(f"{KILO_BASE_URL}/models", timeout=30)
+def refresh_openrouter_models(settings: dict) -> dict:
+    """Refresh OpenRouter settings while capping output tokens for chat completions."""
+    data = http_get_json(f"{OPENROUTER_BASE_URL}/models", timeout=30)
     if not data:
         return settings
 
     by_id = {m["id"]: m for m in data.get("data", []) if "id" in m}
     for model in settings.get("customModels", []):
-        kilo_id = KILO_MODEL_MAP.get(model.get("id", ""))
-        if not kilo_id:
+        or_id = OPENROUTER_MODEL_MAP.get(model.get("id", ""))
+        if not or_id:
             continue
-        meta = by_id.get(kilo_id)
+        meta = by_id.get(or_id)
         if not meta:
             print(
-                f"warning: Kilo gateway no longer reports {kilo_id}",
+                f"warning: OpenRouter no longer reports {or_id}",
                 file=sys.stderr,
             )
             continue
         ctx = meta.get("context_length")
         if ctx is not None and ctx > 0:
-            model["maxOutputTokens"] = ctx
+            model["maxOutputTokens"] = min(ctx, 16384)
         else:
             print(
-                f"warning: no context_length for {kilo_id}",
+                f"warning: no context_length for {or_id}",
                 file=sys.stderr,
             )
     return settings
@@ -176,10 +176,10 @@ def refresh_mode() -> None:
         ollama = refresh_ollama_models(load_json(OLLAMA_SETTINGS))
         save_json(OLLAMA_SETTINGS, ollama)
         print(f"refreshed {OLLAMA_SETTINGS}")
-    if KILO_SETTINGS.exists():
-        kilo = refresh_kilo_models(load_json(KILO_SETTINGS))
-        save_json(KILO_SETTINGS, kilo)
-        print(f"refreshed {KILO_SETTINGS}")
+    if OPENROUTER_SETTINGS.exists():
+        or_settings = refresh_openrouter_models(load_json(OPENROUTER_SETTINGS))
+        save_json(OPENROUTER_SETTINGS, or_settings)
+        print(f"refreshed {OPENROUTER_SETTINGS}")
 
 
 # ---------------------------------------------------------------------------
@@ -476,14 +476,14 @@ def launch_droid(settings_file: Path, session_id: Optional[str]) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Start Droid with Ollama or Kilo custom model settings.",
+        description="Start Droid with Ollama or OpenRouter custom model settings.",
     )
     parser.add_argument(
         "-m",
         "--mode",
         required=True,
-        choices=["ollama", "kilo", "refresh"],
-        help="Backend mode: ollama (default file), kilo, or refresh model parameters.",
+        choices=["ollama", "openrouter", "refresh"],
+        help="Backend mode: ollama (default file), openrouter, or refresh model parameters.",
     )
     return parser
 
@@ -495,14 +495,14 @@ def main() -> None:
     if args.mode == "refresh":
         refresh_mode()
         settings_file = OLLAMA_SETTINGS
-    elif args.mode == "kilo":
-        if "KILO_API_KEY" not in os.environ:
+    elif args.mode == "openrouter":
+        if "OPENROUTER_API_KEY" not in os.environ:
             print(
-                "error: KILO_API_KEY environment variable is required for kilo mode",
+                "error: OPENROUTER_API_KEY environment variable is required for openrouter mode",
                 file=sys.stderr,
             )
             sys.exit(1)
-        settings_file = KILO_SETTINGS
+        settings_file = OPENROUTER_SETTINGS
     else:
         settings_file = OLLAMA_SETTINGS
 
@@ -517,4 +517,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
